@@ -39,28 +39,42 @@
 #include <filesystem>
 #include <iostream>
 #include <set>
+#include <vector>
+
+#include "loaderpathresolver.h"
 
 using namespace std;
 
-void containsLibs(const string &dylib);
-
 const string OTOOL{"otool -L "};
-const string HOMEBREW{"/opt/homebrew"}; // TODO: read from environment
-const string MACPORTS{"/opt/local"};    // TODO: read from environment
-const string XCODE{"/Applications/Xcode.app"};
+
 const string SYSTEM_LIBS{"/System/Library/"};
-const string LOCAL_LIBS{"/usr/local"};
-set<string> packageLibs;
+const string LIBS{"/usr/lib"};
+set<string> systemLibs;
+set<string> userLibs;
+
 const string RPATH{"@rpath"};
 set<string> rpathLibs;
 const string LOADER_PATH{"@loader_path"};
-set<string> loaderLibs;
+vector<pair<string, string>> loaderLibs; // calling dylib, referenced dylib
 const string EXECUTABLE_PATH{"@executable_path"};
 set<string> executableLibs;
-set<string> otherLibs;
 
+string libFileName{}; // dynlib to parse
+string pathToLibFileName{};
 vector<string> options{}; // command line options
-    // (-v verbose, -p package libs -r rpath libs, -e executable libs, -l loader_path libs, -a all libs)
+    // (-v verbose, -u user libs -r rpath libs, -e executable libs, -l loader_path libs, -s system libs)
+
+string absPath(const string &filename)
+{
+    int index = filename.find_last_of("/\\");
+    return filename.substr(0, index);
+}
+
+string filenameNoPath(const string &filename)
+{
+    int index = filename.find_last_of("/\\");
+    return filename.substr(index + 1);
+}
 
 string trim(const string &str)
 {
@@ -74,17 +88,16 @@ string trim(const string &str)
 
 ///
 /// \brief firstWord - Assumption str starts with non whitespace character
-/// \param str String where to extract first word (ending by \0)
+/// \param str String where to extract first word
 ///
-void firstWord(char *str)
+void firstWord(string &str)
 {
-    int len = strlen(str);
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < str.size(); i++) {
         if (isspace(str[i])) {
-            str[i] = '\0';
+            str.erase(i, str.size());
+            return;
         }
     };
-    str[len] = '\0';
 }
 
 ///
@@ -98,31 +111,8 @@ bool startsWith(const string &str, const string &pre)
     return str.compare(0, pre.size(), pre) == 0 ? true : false;
 }
 
-void extractLibs(const vector<string> &dylibs)
-{
-    for (const string &dylib : dylibs) {
-        if (startsWith(dylib, HOMEBREW) || startsWith(dylib, MACPORTS)) {
-            packageLibs.insert(dylib);
-        } else if (startsWith(dylib, RPATH)) {
-            rpathLibs.insert(dylib);
-        } else if (startsWith(dylib, LOADER_PATH)) {
-            loaderLibs.insert(dylib);
-        } else if (startsWith(dylib, EXECUTABLE_PATH)) {
-            executableLibs.insert(dylib);
-        } else {
-            otherLibs.insert(dylib);
-        }
-    }
-}
-
 void printLibs()
 {
-    cout << "----------------------------------------------------------------" << endl;
-    cout << "*** libs from package manager ***" << endl;
-    for (const string &dylib : packageLibs) {
-        cout << dylib << endl;
-    }
-
     cout << "----------------------------------------------------------------" << endl;
     cout << "*** @rpath ***" << endl;
     for (const string &dylib : rpathLibs) {
@@ -131,8 +121,8 @@ void printLibs()
 
     cout << "----------------------------------------------------------------" << endl;
     cout << "*** @loader_path ***" << endl;
-    for (const string &dylib : loaderLibs) {
-        cout << dylib << endl;
+    for (const pair<string, string> &dylib : loaderLibs) {
+        cout << dylib.first << " -- " << dylib.second << endl;
     }
 
     cout << "----------------------------------------------------------------" << endl;
@@ -142,20 +132,22 @@ void printLibs()
     }
 
     cout << "----------------------------------------------------------------" << endl;
-    cout << "*** OTHER libs ***" << endl;
-    for (const string &dylib : otherLibs) {
+    cout << "*** system libs ***" << endl;
+    for (const string &dylib : systemLibs) {
         cout << dylib << endl;
     }
     cout << "----------------------------------------------------------------" << endl;
 }
 
-void containsLibs(const string &dylib)
+vector<string> toBeProcessedLibs;
+set<string> processedLibs;
+
+void libsReferred(const string &dylib)
 {
     string cmd{OTOOL};
     cmd.append(dylib);
-    if (std::count(options.begin(), options.end(), "v")) {
-        cout << "Cmd = " << cmd << endl;
-    }
+    cmd.append(" | awk '{ print $1 }'");
+    // cout << "Calling " << cmd << endl;
 
     FILE *fp;
     char path[PATH_MAX];
@@ -166,99 +158,91 @@ void containsLibs(const string &dylib)
         return;
     }
 
-    vector<string> dylibs;
+    // ignore 1st line, since it is the calling dylib
+    if (fgets(path, PATH_MAX, fp) == NULL) {
+        return;
+    }
+    while (fgets(path, PATH_MAX, fp) != NULL) {
+        char *pos = strchr(path, '\n');
+        if (pos == nullptr)
+            continue;
+        *pos = '\0';
 
-    while (fgets(path, PATH_MAX, fp) != NULL)
-        if (path[0] == '\t') {
-            firstWord(path + 1);
-            // exclude libs fro further processing
-            if ((strcmp(dylib.c_str(), path + 1) != 0) && // no duplicates
-                !startsWith(path + 1, XCODE) &&           // no XCODE libs
-                !startsWith(path + 1, SYSTEM_LIBS)) {     // no system libs
-                dylibs.push_back(path + 1);
-                if (!startsWith(path + 1, "/usr")) {
-                    containsLibs(path + 1);
-                }
-            }
+        // duplicate?
+        if (dylib.compare(path) == 0)
+            continue;
+
+        // system libs
+        if (startsWith(path, SYSTEM_LIBS) || startsWith(path, LIBS)) {
+            systemLibs.insert(path);
+            continue;
         }
+
+        // @rpath
+        if (startsWith(path, RPATH)) {
+            // Collect for processing later on
+            rpathLibs.insert(path);
+            continue;
+        }
+
+        // @loader_path
+        if (startsWith(path, LOADER_PATH)) {
+            // Collect for processing later on
+            loaderLibs.push_back(make_pair(dylib, path));
+            //            toBeProcessedLibs.push_back(LoaderPathResolver::loader_path(dylib, path));
+            continue;
+        }
+
+        // @executable_path
+        // Collect for processing later on
+        if (startsWith(path, EXECUTABLE_PATH)) {
+            executableLibs.insert(path);
+            continue;
+        }
+
+        toBeProcessedLibs.push_back(path);
+    }
+
     pclose(fp);
-    extractLibs(dylibs);
+
+    while (!toBeProcessedLibs.empty()) {
+        string lib = toBeProcessedLibs.back();
+        toBeProcessedLibs.pop_back();
+        auto result = processedLibs.insert(lib);
+        if (result.second == true) {
+            cout << lib << endl;
+            libsReferred(lib);
+        }
+    }
 }
 
 int main(int argc, char *argv[])
 {
+    if (argc == 1) {
+        std::cerr << "No dylib filename given!" << endl;
+        std::cerr << "usage: otoolrecursive [-vurels]  <dylib file>\n";
+        return EXIT_FAILURE;
+    }
+
     // Parsing command line arguments
-    string libFileName{};
     for (int i = 1; i < argc; ++i) {
         if (argv[i][0] == '-' && strlen(argv[i]) == 2) {
             options.push_back(argv[i] + 1);
 
         } else if (filesystem::exists(argv[i])) {
-            libFileName = argv[i];
+            libFileName = filesystem::absolute(argv[i]);
+            pathToLibFileName = absPath(libFileName);
         } else {
             std::cerr << "usage: otoolrecursive [-vprelo]  <dynlib file>\n";
             return EXIT_FAILURE;
         }
     }
 
-    containsLibs(libFileName);
+    libsReferred(libFileName);
+    //    containsLibs(libFileName);
 
     if (std::count(options.begin(), options.end(), "v")) {
         printLibs();
     }
-
-    bool allLibs{true};
-    if (std::count(options.begin(), options.end(), "p")) {
-        for (const string &dylib : packageLibs) {
-            cout << dylib << endl;
-        }
-        allLibs = false;
-    }
-    if (std::count(options.begin(), options.end(), "r")) {
-        for (const string &dylib : rpathLibs) {
-            cout << dylib << endl;
-        }
-        allLibs = false;
-    }
-
-    if (std::count(options.begin(), options.end(), "e")) {
-        for (const string &dylib : executableLibs) {
-            cout << dylib << endl;
-        }
-        allLibs = false;
-    }
-
-    if (std::count(options.begin(), options.end(), "l")) {
-        for (const string &dylib : loaderLibs) {
-            cout << dylib << endl;
-        }
-        allLibs = false;
-    }
-
-    if (std::count(options.begin(), options.end(), "o")) {
-        for (const string &dylib : otherLibs) {
-            cout << dylib << endl;
-        }
-        allLibs = false;
-    }
-
-    if (allLibs) {
-        for (const string &dylib : packageLibs) {
-            cout << dylib << endl;
-        }
-        for (const string &dylib : rpathLibs) {
-            cout << dylib << endl;
-        }
-        for (const string &dylib : executableLibs) {
-            cout << dylib << endl;
-        }
-        for (const string &dylib : loaderLibs) {
-            cout << dylib << endl;
-        }
-        for (const string &dylib : otherLibs) {
-            cout << dylib << endl;
-        }
-    }
-
     return EXIT_SUCCESS;
 }
