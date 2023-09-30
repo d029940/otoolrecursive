@@ -1,4 +1,4 @@
-# otoolsrecursive
+# otoolrecursive
 
 Command line tool which lists refernced dylibs in a given dylib recursively
 Usage: otoolrecursive [-vprelo]  <dynlib file>
